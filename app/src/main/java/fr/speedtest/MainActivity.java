@@ -58,8 +58,37 @@ import java.util.function.BooleanSupplier;
 public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ serveurs
-    static String DOWN = "https://speed.cloudflare.com/__down";
-    static String UP = "https://speed.cloudflare.com/__up";
+    /** Un serveur de test. « exact » = accepte ?bytes=N (Cloudflare). Sinon c'est un gros fichier fixe lu avec « Range ». */
+    static class Server {
+        final String name, down, up;
+        final boolean exact;
+        Server(String name, String down, String up, boolean exact) {
+            this.name = name;
+            this.down = down;
+            this.up = up;
+            this.exact = exact;
+        }
+    }
+
+    /** Erreur HTTP : le code 429 veut dire « trop de requêtes », le serveur nous limite. */
+    static class HttpFail extends IOException {
+        final int code, retryAfter;
+        HttpFail(int code, int retryAfter) {
+            super("HTTP " + code + (code == 429 ? " (serveur de test saturé : trop de requêtes)" : ""));
+            this.code = code;
+            this.retryAfter = retryAfter;
+        }
+    }
+
+    // Si un serveur refuse (429, panne…), l'appli passe automatiquement au suivant.
+    static Server[] SERVERS = {
+            new Server("Cloudflare", "https://speed.cloudflare.com/__down", "https://speed.cloudflare.com/__up", true),
+            new Server("OVH", "https://proof.ovh.net/files/100Mb.dat", null, false),
+            new Server("Hetzner", "https://fsn1-speed.hetzner.com/100MB.bin", null, false),
+            new Server("Tele2", "https://speedtest.tele2.net/100MB.zip", "https://speedtest.tele2.net/upload.php", false)
+    };
+    volatile Server cur = SERVERS[0];      // serveur utilisé pour le ping et le téléchargement
+    volatile Server upCur = null;          // serveur utilisé pour l'envoi
 
     // ------------------------------------------------------------------ couleurs
     static final int BG = 0xFF0E1116, CARD = 0xFF181D26, TXT = 0xFFE8ECF2, MUT = 0xFF8B95A7,
@@ -456,16 +485,60 @@ public class MainActivity extends Activity {
         try { Thread.sleep(ms); } catch (InterruptedException ignored) { }
     }
 
-    double pingOnce(String url) throws IOException {
-        long t0 = System.nanoTime();
-        HttpURLConnection c = open(url, "GET");
+    HttpFail failOf(HttpURLConnection c, int code) {
+        int ra = 0;
+        try { ra = Integer.parseInt(c.getHeaderField("Retry-After").trim()); } catch (Exception ignored) { }
+        return new HttpFail(code, ra);
+    }
+
+    void checkDown(HttpURLConnection c) throws IOException {
         int code = c.getResponseCode();
-        if (code != 200) throw new IOException("HTTP " + code);
+        if (code != 200 && code != 206) throw failOf(c, code);
+    }
+
+    HttpURLConnection openDown(Server s, long start, long len) throws IOException {
+        if (s.exact) return open(s.down + "?bytes=" + len + "&r=" + rnd(), "GET");
+        HttpURLConnection c = open(s.down, "GET");
+        c.setRequestProperty("Range", "bytes=" + start + "-" + (start + len - 1));
+        return c;
+    }
+
+    double pingOnce(Server s) throws IOException {
+        long t0 = System.nanoTime();
+        HttpURLConnection c = openDown(s, 0, s.exact ? 0 : 1);
+        checkDown(c);
         InputStream in = c.getInputStream();
         byte[] buf = new byte[1024];
-        while (in.read(buf) >= 0) { /* on vide la réponse pour réutiliser la connexion */ }
+        int total = 0, n;
+        while ((n = in.read(buf)) >= 0) {
+            total += n;
+            if (total > 4096) break;               // serveur qui ignore « Range » : on n'avale pas le fichier
+        }
         in.close();
+        if (total > 4096) c.disconnect();
         return (System.nanoTime() - t0) / 1e6;
+    }
+
+    /** Choisit le premier serveur qui répond (le serveur courant d'abord). */
+    Server pickServer() throws IOException {
+        List<Server> order = new ArrayList<>();
+        order.add(cur);
+        for (Server s : SERVERS) if (s != cur) order.add(s);
+        StringBuilder errs = new StringBuilder();
+        for (Server s : order) {
+            chk();
+            try {
+                pingOnce(s);
+                cur = s;
+                log("Serveur choisi : " + s.name);
+                return s;
+            } catch (IOException e) {
+                log("Serveur " + s.name + " inaccessible : " + e.getMessage());
+                if (errs.length() > 0) errs.append(" ; ");
+                errs.append(s.name).append(" : ").append(e.getMessage());
+            }
+        }
+        throw new IOException("aucun serveur de test accessible (" + errs + ")");
     }
 
     static class PingRes {
@@ -474,12 +547,13 @@ public class MainActivity extends Activity {
     }
 
     PingRes measurePing(int count) throws Exception {
+        final Server srv = pickServer();
         List<Double> raw = new ArrayList<>();
         int lost = 0;
         for (int i = 0; i < count; i++) {
             chk();
             try {
-                double v = pingOnce(DOWN + "?bytes=0&r=" + rnd());
+                double v = pingOnce(srv);
                 raw.add(v);
                 gset(v, "Ping…", "ms", GOOD);
             } catch (IOException e) {
@@ -487,7 +561,7 @@ public class MainActivity extends Activity {
                 lastErr = String.valueOf(e.getMessage());
             }
             say("Mesure du ping… " + (i + 1) + "/" + count);
-            sleepQuiet(40);
+            sleepQuiet(80);
         }
         if (raw.size() < 8) throw new IOException("trop de requêtes perdues (" + lastErr + ")");
         raw.remove(0);                                   // la 1re inclut DNS + TLS
@@ -520,13 +594,16 @@ public class MainActivity extends Activity {
     /** Mesure le ping pendant un transfert pour détecter si la connexion sature. */
     class LoadedPinger extends Thread {
         volatile boolean stop;
+        final Server srv;
         final List<Double> vals = Collections.synchronizedList(new ArrayList<Double>());
+
+        LoadedPinger(Server srv) { this.srv = srv; }
 
         @Override public void run() {
             sleepQuiet(1500);
             while (!stop) {
-                try { vals.add(pingOnce(DOWN + "?bytes=0&r=" + rnd())); } catch (Exception ignored) { }
-                sleepQuiet(250);
+                try { vals.add(pingOnce(srv)); } catch (Exception ignored) { }
+                sleepQuiet(700);                       // peu de requêtes : on évite de se faire limiter
             }
         }
 
@@ -629,8 +706,8 @@ public class MainActivity extends Activity {
         }
     }
 
-    Rate runDownload() throws Exception {
-        final int chunk = 10_000_000;
+    Rate runDownload(final Server srv) throws Exception {
+        final long chunk = srv.exact ? 50_000_000L : 90_000_000L;   // peu de gros blocs = peu de requêtes
         netStop = false;
         dlBytes.set(0);
         okCount.set(0);
@@ -644,10 +721,9 @@ public class MainActivity extends Activity {
                     while (!netStop) {
                         HttpURLConnection c = null;
                         try {
-                            c = open(DOWN + "?bytes=" + chunk + "&r=" + rnd(), "GET");
+                            c = openDown(srv, 0, chunk);
                             synchronized (conns) { conns.add(c); }
-                            int code = c.getResponseCode();
-                            if (code != 200) throw new IOException("HTTP " + code);
+                            checkDown(c);
                             InputStream in = c.getInputStream();
                             int n;
                             while (!netStop && (n = in.read(buf)) >= 0) dlBytes.addAndGet(n);
@@ -657,7 +733,7 @@ public class MainActivity extends Activity {
                             if (!netStop) {
                                 failCount.incrementAndGet();
                                 lastErr = String.valueOf(e.getMessage());
-                                sleepQuiet(300);
+                                sleepQuiet(backoff(e));
                             }
                         } finally {
                             if (c != null) {
@@ -672,11 +748,11 @@ public class MainActivity extends Activity {
             t.start();
             ts.add(t);
         }
-        LoadedPinger lp = new LoadedPinger();
+        LoadedPinger lp = new LoadedPinger(srv);
         lp.setDaemon(true);
         lp.start();
         Rate r = meter(dlBytes, dur, Math.min(2, dur * 0.3), "Téléchargement", ACC, new BooleanSupplier() {
-            @Override public boolean getAsBoolean() { return okCount.get() == 0 && failCount.get() >= 8; }
+            @Override public boolean getAsBoolean() { return dlBytes.get() == 0 && failCount.get() >= 3; }
         });
         r.loaded = lp.finish();
         netStop = true;
@@ -689,7 +765,7 @@ public class MainActivity extends Activity {
         return r;
     }
 
-    Rate runUpload() throws Exception {
+    Rate runUpload(final Server srv) throws Exception {
         final int len = 4 * 1024 * 1024;
         netStop = false;
         upBytes.set(0);
@@ -705,7 +781,7 @@ public class MainActivity extends Activity {
                     while (!netStop) {
                         HttpURLConnection c = null;
                         try {
-                            c = open(UP + "?r=" + rnd(), "POST");
+                            c = open(srv.up + (srv.up.contains("?") ? "&" : "?") + "r=" + rnd(), "POST");
                             synchronized (conns) { conns.add(c); }
                             c.setDoOutput(true);
                             c.setFixedLengthStreamingMode(len);
@@ -720,13 +796,13 @@ public class MainActivity extends Activity {
                             if (netStop) break;
                             out.close();
                             int code = c.getResponseCode();
-                            if (code < 200 || code >= 300) throw new IOException("HTTP " + code);
+                            if (code < 200 || code >= 300) throw failOf(c, code);
                             okCount.incrementAndGet();
                         } catch (Exception e) {
                             if (!netStop) {
                                 failCount.incrementAndGet();
                                 lastErr = String.valueOf(e.getMessage());
-                                sleepQuiet(300);
+                                sleepQuiet(backoff(e));
                             }
                         } finally {
                             if (c != null) {
@@ -741,11 +817,11 @@ public class MainActivity extends Activity {
             t.start();
             ts.add(t);
         }
-        LoadedPinger lp = new LoadedPinger();
+        LoadedPinger lp = new LoadedPinger(cur);
         lp.setDaemon(true);
         lp.start();
         Rate r = meter(upBytes, dur, Math.min(2, dur * 0.3), "Envoi", WARN, new BooleanSupplier() {
-            @Override public boolean getAsBoolean() { return okCount.get() == 0 && failCount.get() >= 4; }
+            @Override public boolean getAsBoolean() { return okCount.get() == 0 && failCount.get() >= 3; }
         });
         r.loaded = lp.finish();
         netStop = true;
@@ -754,8 +830,47 @@ public class MainActivity extends Activity {
         log("Montant : " + okCount.get() + " blocs envoyés, " + failCount.get() + " échecs, "
                 + Math.round(upBytes.get() / 1e6) + " Mo");
         chk();
-        if (upBytes.get() < 1000) throw new IOException("aucune donnée envoyée (" + lastErr + ")");
+        // les octets sont comptés quand ils partent ; si le serveur a refusé tous les envois, ce n'est pas une mesure valable
+        if (upBytes.get() < 1000 || (okCount.get() == 0 && failCount.get() > 0))
+            throw new IOException("aucune donnée envoyée (" + lastErr + ")");
         return r;
+    }
+
+    /** Pause avant de réessayer : on respecte « Retry-After » quand le serveur dit qu'on va trop vite (429). */
+    static long backoff(Exception e) {
+        if (e instanceof HttpFail && ((HttpFail) e).code == 429) {
+            long ms = ((HttpFail) e).retryAfter * 1000L;
+            return Math.max(1500, Math.min(ms, 5000));
+        }
+        return 300;
+    }
+
+    /** Une passe de mesure. Si le serveur refuse ou ne répond pas, on essaie automatiquement le suivant. */
+    Rate onePass(boolean download) throws Exception {
+        Server first = download ? cur : upCur;
+        List<Server> order = new ArrayList<>();
+        if (first != null) order.add(first);
+        for (Server s : SERVERS) {
+            if (s == first) continue;
+            if (!download && s.up == null) continue;
+            order.add(s);
+        }
+        Exception last = null;
+        for (Server s : order) {
+            chk();
+            try {
+                Rate r = download ? runDownload(s) : runUpload(s);
+                if (download) cur = s; else upCur = s;
+                return r;
+            } catch (Exception e) {
+                if (cancelled) throw e;
+                last = e;
+                log((download ? "Téléchargement" : "Envoi") + " via " + s.name + " impossible : " + e.getMessage());
+                say("Serveur " + s.name + " indisponible, essai du suivant…");
+                sleepQuiet(600);
+            }
+        }
+        throw last != null ? last : new IOException("aucun serveur disponible");
     }
 
     Rate multiPass(boolean download) throws Exception {
@@ -763,14 +878,37 @@ public class MainActivity extends Activity {
         for (int i = 0; i < passes; i++) {
             chk();
             if (passes > 1) say((download ? "Descendant" : "Montant") + " : passe " + (i + 1) + "/" + passes);
-            rs.add(download ? runDownload() : runUpload());
+            rs.add(onePass(download));
             if (i < passes - 1) sleepQuiet(1200);
         }
         return combine(rs);
     }
 
+    /** Vrai téléchargement de 50 Mo avec bascule automatique de serveur. */
+    double[] real50Any() throws Exception {
+        List<Server> order = new ArrayList<>();
+        order.add(cur);
+        for (Server s : SERVERS) if (s != cur) order.add(s);
+        Exception last = null;
+        for (Server s : order) {
+            chk();
+            try {
+                double[] r = real50(s);
+                cur = s;
+                return r;
+            } catch (Exception e) {
+                if (cancelled) throw e;
+                last = e;
+                log("Test 50 Mo via " + s.name + " impossible : " + e.getMessage());
+                say("Serveur " + s.name + " indisponible, essai du suivant…");
+                sleepQuiet(600);
+            }
+        }
+        throw last != null ? last : new IOException("aucun serveur disponible");
+    }
+
     /** Vrai téléchargement de 50 Mo : on chronomètre le temps réel. */
-    double[] real50() throws Exception {
+    double[] real50(final Server srv) throws Exception {
         final long total = 50_000_000L, size = 12_500_000L;
         final AtomicLong alloc = new AtomicLong();
         final AtomicLong got = new AtomicLong();
@@ -788,13 +926,16 @@ public class MainActivity extends Activity {
                         long want = Math.min(size, total - start);
                         HttpURLConnection c = null;
                         try {
-                            c = open(DOWN + "?bytes=" + want + "&r=" + rnd(), "GET");
+                            c = openDown(srv, start, want);
                             synchronized (conns) { conns.add(c); }
-                            int code = c.getResponseCode();
-                            if (code != 200) throw new IOException("HTTP " + code);
+                            checkDown(c);
                             InputStream in = c.getInputStream();
                             int n;
-                            while ((n = in.read(buf)) >= 0) got.addAndGet(n);
+                            long left = want;                      // on s'arrête à la taille demandée, même si le serveur envoie plus
+                            while (left > 0 && (n = in.read(buf, 0, (int) Math.min(buf.length, left))) >= 0) {
+                                got.addAndGet(n);
+                                left -= n;
+                            }
                             in.close();
                         } catch (Exception e) {
                             error.compareAndSet(null, String.valueOf(e.getMessage()));
@@ -1213,6 +1354,8 @@ public class MainActivity extends Activity {
         out.add("Modèle : " + Build.MANUFACTURER + " " + Build.MODEL);
         String batStart = batteryInfo();
         double pingMed = -1, jitter = 0, dlAvg = -1, ulAvg = -1, loaded = -1;
+        cur = SERVERS[0];
+        upCur = null;
         log("=== nouveau test (" + dur + " s, " + passes + " passe(s)) ===");
 
         // ---- 1) ping
@@ -1245,6 +1388,7 @@ public class MainActivity extends Activity {
                 cDl.detail("Soit " + fr(d.avg / 8, 2) + " Mo/s · Pic : " + fr(d.peak, 1) + " Mb/s · Plus bas : "
                         + fr(d.low, 1) + " Mb/s\nMarge : ± " + fr(d.margin, 1) + " Mb/s (" + reliability(d.rel) + ")"
                         + (d.runs.size() > 1 ? " · Passes : " + joinRuns(d.runs) : "")
+                        + "\nServeur : " + cur.name
                         + (d.loaded >= 0 ? "\nPing pendant le téléchargement : " + fr(d.loaded, 0) + " ms ("
                         + (d.loaded - pingMed >= 0 ? "+" : "") + fr(d.loaded - pingMed, 0) + " ms)" : ""));
                 gset(d.avg, "Téléchargement", "Mb/s", GOOD);
@@ -1269,7 +1413,7 @@ public class MainActivity extends Activity {
                 List<Double> times = new ArrayList<>();
                 double bytes = 0;
                 for (int i = 0; i < Math.min(passes, 2); i++) {
-                    double[] m = real50();
+                    double[] m = real50Any();
                     times.add(m[0]);
                     bytes = m[1];
                 }
@@ -1297,6 +1441,7 @@ public class MainActivity extends Activity {
                 cUl.detail("Soit " + fr(u.avg / 8, 2) + " Mo/s · Pic : " + fr(u.peak, 1) + " Mb/s · Plus bas : "
                         + fr(u.low, 1) + " Mb/s\nMarge : ± " + fr(u.margin, 1) + " Mb/s (" + reliability(u.rel) + ")"
                         + (u.runs.size() > 1 ? " · Passes : " + joinRuns(u.runs) : "")
+                        + (upCur != null ? "\nServeur : " + upCur.name : "")
                         + (u.loaded >= 0 ? "\nPing pendant l'envoi : " + fr(u.loaded, 0) + " ms ("
                         + (u.loaded - pingMed >= 0 ? "+" : "") + fr(u.loaded - pingMed, 0) + " ms)" : ""));
                 gset(u.avg, "Envoi", "Mb/s", GOOD);
