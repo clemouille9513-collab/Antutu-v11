@@ -89,6 +89,7 @@ public class MainActivity extends Activity {
     };
     volatile Server cur = SERVERS[0];      // serveur utilisé pour le ping et le téléchargement
     volatile Server upCur = null;          // serveur utilisé pour l'envoi
+    volatile String dlTried = "", upTried = "";   // serveurs refusés avant celui qui a marché, avec la raison
 
     // ------------------------------------------------------------------ couleurs
     static final int BG = 0xFF0E1116, CARD = 0xFF181D26, TXT = 0xFFE8ECF2, MUT = 0xFF8B95A7,
@@ -766,7 +767,7 @@ public class MainActivity extends Activity {
     }
 
     Rate runUpload(final Server srv) throws Exception {
-        final int len = 4 * 1024 * 1024;
+        final int len = 25 * 1024 * 1024;
         netStop = false;
         upBytes.set(0);
         okCount.set(0);
@@ -855,22 +856,23 @@ public class MainActivity extends Activity {
             if (!download && s.up == null) continue;
             order.add(s);
         }
-        Exception last = null;
+        StringBuilder errs = new StringBuilder();
         for (Server s : order) {
             chk();
             try {
                 Rate r = download ? runDownload(s) : runUpload(s);
-                if (download) cur = s; else upCur = s;
+                if (download) { cur = s; dlTried = errs.toString(); } else { upCur = s; upTried = errs.toString(); }
                 return r;
             } catch (Exception e) {
                 if (cancelled) throw e;
-                last = e;
                 log((download ? "Téléchargement" : "Envoi") + " via " + s.name + " impossible : " + e.getMessage());
                 say("Serveur " + s.name + " indisponible, essai du suivant…");
+                if (errs.length() > 0) errs.append(" ; ");
+                errs.append(s.name).append(" : ").append(e.getMessage());
                 sleepQuiet(600);
             }
         }
-        throw last != null ? last : new IOException("aucun serveur disponible");
+        throw new IOException(errs.length() > 0 ? errs.toString() : "aucun serveur disponible");
     }
 
     Rate multiPass(boolean download) throws Exception {
@@ -889,7 +891,7 @@ public class MainActivity extends Activity {
         List<Server> order = new ArrayList<>();
         order.add(cur);
         for (Server s : SERVERS) if (s != cur) order.add(s);
-        Exception last = null;
+        StringBuilder errs = new StringBuilder();
         for (Server s : order) {
             chk();
             try {
@@ -898,53 +900,55 @@ public class MainActivity extends Activity {
                 return r;
             } catch (Exception e) {
                 if (cancelled) throw e;
-                last = e;
                 log("Test 50 Mo via " + s.name + " impossible : " + e.getMessage());
                 say("Serveur " + s.name + " indisponible, essai du suivant…");
+                if (errs.length() > 0) errs.append(" ; ");
+                errs.append(s.name).append(" : ").append(e.getMessage());
                 sleepQuiet(600);
             }
         }
-        throw last != null ? last : new IOException("aucun serveur disponible");
+        throw new IOException(errs.length() > 0 ? errs.toString() : "aucun serveur disponible");
     }
 
-    /** Vrai téléchargement de 50 Mo : on chronomètre le temps réel. */
+    /**
+     * Vrai téléchargement de 50 Mo. On utilise exactement la même méthode que le test de débit
+     * (4 flux), et on chronomètre jusqu'à l'instant précis où le 50e mégaoctet est arrivé.
+     */
     double[] real50(final Server srv) throws Exception {
-        final long total = 50_000_000L, size = 12_500_000L;
-        final AtomicLong alloc = new AtomicLong();
+        final long total = 50_000_000L;
+        final long chunk = srv.exact ? total : 90_000_000L;
         final AtomicLong got = new AtomicLong();
+        final AtomicLong doneAt = new AtomicLong(0);
         final AtomicReference<String> error = new AtomicReference<>(null);
         netStop = false;
-        long t0 = System.nanoTime();
+        final long t0 = System.nanoTime();
         List<Thread> ts = new ArrayList<>();
         for (int i = 0; i < 4; i++) {
             Thread t = new Thread(new Runnable() {
                 @Override public void run() {
                     byte[] buf = new byte[65536];
-                    while (!netStop) {
-                        long start = alloc.getAndAdd(size);
-                        if (start >= total) break;
-                        long want = Math.min(size, total - start);
-                        HttpURLConnection c = null;
-                        try {
-                            c = openDown(srv, start, want);
-                            synchronized (conns) { conns.add(c); }
-                            checkDown(c);
-                            InputStream in = c.getInputStream();
-                            int n;
-                            long left = want;                      // on s'arrête à la taille demandée, même si le serveur envoie plus
-                            while (left > 0 && (n = in.read(buf, 0, (int) Math.min(buf.length, left))) >= 0) {
-                                got.addAndGet(n);
-                                left -= n;
+                    HttpURLConnection c = null;
+                    try {
+                        c = openDown(srv, 0, chunk);
+                        synchronized (conns) { conns.add(c); }
+                        checkDown(c);
+                        InputStream in = c.getInputStream();
+                        int n;
+                        while (!netStop && (n = in.read(buf)) >= 0) {
+                            long g = got.addAndGet(n);
+                            if (g >= total) {
+                                doneAt.compareAndSet(0, System.nanoTime());
+                                netStop = true;
+                                break;
                             }
-                            in.close();
-                        } catch (Exception e) {
-                            error.compareAndSet(null, String.valueOf(e.getMessage()));
-                            break;
-                        } finally {
-                            if (c != null) {
-                                synchronized (conns) { conns.remove(c); }
-                                c.disconnect();
-                            }
+                        }
+                        in.close();
+                    } catch (Exception e) {
+                        if (!netStop) error.compareAndSet(null, String.valueOf(e.getMessage()));
+                    } finally {
+                        if (c != null) {
+                            synchronized (conns) { conns.remove(c); }
+                            c.disconnect();
                         }
                     }
                 }
@@ -957,15 +961,21 @@ public class MainActivity extends Activity {
             boolean alive = false;
             for (Thread t : ts) if (t.isAlive()) alive = true;
             double el = (System.nanoTime() - t0) / 1e9;
-            gset(got.get() * 8 / 1e6 / Math.max(el, 0.05), "50 Mo : " + fr(got.get() / 1e6, 1) + " / 50", "Mb/s", ACC);
-            if (!alive || cancelled) break;
-            if (el > 120) { netStop = true; disconnectAll(); break; }
-            sleepQuiet(150);
+            gset(Math.min(got.get(), total) * 8 / 1e6 / Math.max(el, 0.05),
+                    "50 Mo : " + fr(Math.min(got.get(), total) / 1e6, 1) + " / 50", "Mb/s", ACC);
+            if (doneAt.get() != 0 || !alive || cancelled) break;
+            if (el > 120) break;
+            sleepQuiet(30);
         }
-        double secs = (System.nanoTime() - t0) / 1e9;
+        netStop = true;
+        disconnectAll();
+        joinAll(ts);
         chk();
-        if (error.get() != null) throw new IOException(error.get());
-        return new double[]{secs, got.get()};
+        if (doneAt.get() == 0) {
+            throw new IOException(error.get() != null ? error.get()
+                    : "téléchargement incomplet (" + got.get() + " octets reçus sur " + total + ")");
+        }
+        return new double[]{(doneAt.get() - t0) / 1e9, total};
     }
 
     // =====================================================================================
@@ -1356,6 +1366,8 @@ public class MainActivity extends Activity {
         double pingMed = -1, jitter = 0, dlAvg = -1, ulAvg = -1, loaded = -1;
         cur = SERVERS[0];
         upCur = null;
+        dlTried = "";
+        upTried = "";
         log("=== nouveau test (" + dur + " s, " + passes + " passe(s)) ===");
 
         // ---- 1) ping
@@ -1389,6 +1401,7 @@ public class MainActivity extends Activity {
                         + fr(d.low, 1) + " Mb/s\nMarge : ± " + fr(d.margin, 1) + " Mb/s (" + reliability(d.rel) + ")"
                         + (d.runs.size() > 1 ? " · Passes : " + joinRuns(d.runs) : "")
                         + "\nServeur : " + cur.name
+                        + (dlTried.isEmpty() ? "" : "\nServeurs refusés avant : " + dlTried)
                         + (d.loaded >= 0 ? "\nPing pendant le téléchargement : " + fr(d.loaded, 0) + " ms ("
                         + (d.loaded - pingMed >= 0 ? "+" : "") + fr(d.loaded - pingMed, 0) + " ms)" : ""));
                 gset(d.avg, "Téléchargement", "Mb/s", GOOD);
@@ -1442,6 +1455,7 @@ public class MainActivity extends Activity {
                         + fr(u.low, 1) + " Mb/s\nMarge : ± " + fr(u.margin, 1) + " Mb/s (" + reliability(u.rel) + ")"
                         + (u.runs.size() > 1 ? " · Passes : " + joinRuns(u.runs) : "")
                         + (upCur != null ? "\nServeur : " + upCur.name : "")
+                        + (upTried.isEmpty() ? "" : "\nServeurs refusés avant : " + upTried)
                         + (u.loaded >= 0 ? "\nPing pendant l'envoi : " + fr(u.loaded, 0) + " ms ("
                         + (u.loaded - pingMed >= 0 ? "+" : "") + fr(u.loaded - pingMed, 0) + " ms)" : ""));
                 gset(u.avg, "Envoi", "Mb/s", GOOD);
