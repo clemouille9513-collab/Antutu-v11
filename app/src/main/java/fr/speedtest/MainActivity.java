@@ -83,13 +83,20 @@ public class MainActivity extends Activity {
     // Si un serveur refuse (429, panne…), l'appli passe automatiquement au suivant.
     static Server[] SERVERS = {
             new Server("Cloudflare", "https://speed.cloudflare.com/__down", "https://speed.cloudflare.com/__up", true),
+            new Server("Hetzner Falkenstein", "https://fsn1-speed.hetzner.com/100MB.bin", null, false),
+            new Server("Hetzner Nuremberg", "https://nbg1-speed.hetzner.com/100MB.bin", null, false),
+            new Server("Hetzner Helsinki", "https://hel1-speed.hetzner.com/100MB.bin", null, false),
             new Server("OVH", "https://proof.ovh.net/files/100Mb.dat", null, false),
-            new Server("Hetzner", "https://fsn1-speed.hetzner.com/100MB.bin", null, false),
+            new Server("Vultr Francfort", "https://fra-de-ping.vultr.com/vultr.com.100MB.bin", null, false),
+            new Server("Leaseweb", "https://mirror.nl.leaseweb.net/speedtest/100mb.bin", null, false),
+            new Server("Cachefly", "https://cachefly.cachefly.net/100mb.test", null, false),
             new Server("Tele2", "https://speedtest.tele2.net/100MB.zip", "https://speedtest.tele2.net/upload.php", false)
     };
     volatile Server cur = SERVERS[0];      // serveur utilisé pour le ping et le téléchargement
     volatile Server upCur = null;          // serveur utilisé pour l'envoi
-    volatile String dlTried = "", upTried = "";   // serveurs refusés avant celui qui a marché, avec la raison
+    volatile String dlTried = "", upTried = "";
+    volatile List<Server> alive = new ArrayList<>();   // serveurs qui ont répondu au départ, du plus rapide au plus lent
+    volatile String probeInfo = "";   // serveurs refusés avant celui qui a marché, avec la raison
 
     // ------------------------------------------------------------------ couleurs
     static final int BG = 0xFF0E1116, CARD = 0xFF181D26, TXT = 0xFFE8ECF2, MUT = 0xFF8B95A7,
@@ -520,26 +527,86 @@ public class MainActivity extends Activity {
         return (System.nanoTime() - t0) / 1e6;
     }
 
-    /** Choisit le premier serveur qui répond (le serveur courant d'abord). */
+    /** Teste tous les serveurs en même temps et garde ceux qui répondent, du plus rapide au plus lent. */
     Server pickServer() throws IOException {
-        List<Server> order = new ArrayList<>();
-        order.add(cur);
-        for (Server s : SERVERS) if (s != cur) order.add(s);
-        StringBuilder errs = new StringBuilder();
-        for (Server s : order) {
-            chk();
-            try {
-                pingOnce(s);
-                cur = s;
-                log("Serveur choisi : " + s.name);
-                return s;
-            } catch (IOException e) {
-                log("Serveur " + s.name + " inaccessible : " + e.getMessage());
-                if (errs.length() > 0) errs.append(" ; ");
-                errs.append(s.name).append(" : ").append(e.getMessage());
+        final int n = SERVERS.length;
+        final double[] lat = new double[n];
+        final String[] err = new String[n];
+        Arrays.fill(lat, -1);
+        List<Thread> ts = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            final int k = i;
+            Thread th = new Thread(new Runnable() {
+                @Override public void run() {
+                    try {
+                        pingOnce(SERVERS[k]);                       // 1re requête : DNS + TLS
+                        double best = Double.MAX_VALUE;
+                        for (int j = 0; j < 2; j++) best = Math.min(best, pingOnce(SERVERS[k]));
+                        lat[k] = best;
+                    } catch (Exception e) {
+                        err[k] = String.valueOf(e.getMessage());
+                    }
+                }
+            });
+            th.setDaemon(true);
+            th.start();
+            ts.add(th);
+        }
+        long deadline = System.currentTimeMillis() + 12000;
+        for (Thread th : ts) {
+            long left = deadline - System.currentTimeMillis();
+            if (left > 0) {
+                try { th.join(left); } catch (InterruptedException ignored) { }
             }
         }
-        throw new IOException("aucun serveur de test accessible (" + errs + ")");
+        chk();
+        List<Integer> okIdx = new ArrayList<>();
+        StringBuilder bad = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            if (lat[i] >= 0) {
+                okIdx.add(i);
+            } else {
+                if (bad.length() > 0) bad.append(" ; ");
+                bad.append(SERVERS[i].name).append(" (").append(err[i] != null ? err[i] : "délai dépassé").append(")");
+            }
+        }
+        Collections.sort(okIdx, new java.util.Comparator<Integer>() {
+            @Override public int compare(Integer x, Integer y) { return Double.compare(lat[x], lat[y]); }
+        });
+        List<Server> ok = new ArrayList<>();
+        StringBuilder good = new StringBuilder();
+        for (int i : okIdx) {
+            ok.add(SERVERS[i]);
+            if (good.length() > 0) good.append(", ");
+            good.append(SERVERS[i].name).append(' ').append(fr(lat[i], 0)).append(" ms");
+        }
+        probeInfo = "Serveurs joignables : " + (good.length() > 0 ? good : "aucun")
+                + (bad.length() > 0 ? "\nInjoignables : " + bad : "");
+        log(probeInfo.replace("\n", " | "));
+        if (ok.isEmpty()) throw new IOException("aucun serveur de test accessible (" + bad + ")");
+        alive = ok;
+        cur = ok.get(0);
+        return cur;
+    }
+
+    /** Ordre d'essai des serveurs : d'abord celui demandé, puis ceux qui ont répondu, et en dernier recours les autres. */
+    List<Server> candidates(Server first, boolean needUp) {
+        List<Server> order = new ArrayList<>();
+        if (first != null && (!needUp || first.up != null)) order.add(first);
+        List<Server> pool = alive.isEmpty() ? Arrays.asList(SERVERS) : alive;
+        for (Server s : pool) {
+            if (s == first) continue;
+            if (needUp && s.up == null) continue;
+            order.add(s);
+        }
+        if (needUp || order.isEmpty()) {
+            for (Server s : SERVERS) {
+                if (order.contains(s)) continue;
+                if (needUp && s.up == null) continue;
+                order.add(s);
+            }
+        }
+        return order;
     }
 
     static class PingRes {
@@ -708,6 +775,10 @@ public class MainActivity extends Activity {
     }
 
     Rate runDownload(final Server srv) throws Exception {
+        return runDownload(srv, 4);
+    }
+
+    Rate runDownload(final Server srv, final int streams) throws Exception {
         final long chunk = srv.exact ? 50_000_000L : 90_000_000L;   // peu de gros blocs = peu de requêtes
         netStop = false;
         dlBytes.set(0);
@@ -715,7 +786,7 @@ public class MainActivity extends Activity {
         failCount.set(0);
         lastErr = "";
         List<Thread> ts = new ArrayList<>();
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < streams; i++) {
             Thread t = new Thread(new Runnable() {
                 @Override public void run() {
                     byte[] buf = new byte[65536];
@@ -849,27 +920,31 @@ public class MainActivity extends Activity {
     /** Une passe de mesure. Si le serveur refuse ou ne répond pas, on essaie automatiquement le suivant. */
     Rate onePass(boolean download) throws Exception {
         Server first = download ? cur : upCur;
-        List<Server> order = new ArrayList<>();
-        if (first != null) order.add(first);
-        for (Server s : SERVERS) {
-            if (s == first) continue;
-            if (!download && s.up == null) continue;
-            order.add(s);
-        }
+        List<Server> order = candidates(first, !download);
         StringBuilder errs = new StringBuilder();
         for (Server s : order) {
-            chk();
-            try {
-                Rate r = download ? runDownload(s) : runUpload(s);
-                if (download) { cur = s; dlTried = errs.toString(); } else { upCur = s; upTried = errs.toString(); }
-                return r;
-            } catch (Exception e) {
-                if (cancelled) throw e;
-                log((download ? "Téléchargement" : "Envoi") + " via " + s.name + " impossible : " + e.getMessage());
-                say("Serveur " + s.name + " indisponible, essai du suivant…");
-                if (errs.length() > 0) errs.append(" ; ");
-                errs.append(s.name).append(" : ").append(e.getMessage());
-                sleepQuiet(600);
+            // certains serveurs limitent les connexions simultanées : si 4 flux sont refusés, on réessaie avec 1 seul
+            int[] tries = download ? new int[]{4, 1} : new int[]{4};
+            for (int k = 0; k < tries.length; k++) {
+                chk();
+                try {
+                    Rate r = download ? runDownload(s, tries[k]) : runUpload(s);
+                    if (download) { cur = s; dlTried = errs.toString(); } else { upCur = s; upTried = errs.toString(); }
+                    return r;
+                } catch (Exception e) {
+                    if (cancelled) throw e;
+                    String msg = String.valueOf(e.getMessage());
+                    log((download ? "Téléchargement" : "Envoi") + " via " + s.name + " (" + tries[k] + " flux) impossible : " + msg);
+                    if (k == tries.length - 1 || msg.contains("HTTP 429")) {
+                        say("Serveur " + s.name + " indisponible, essai du suivant…");
+                        if (errs.length() > 0) errs.append(" ; ");
+                        errs.append(s.name).append(" : ").append(msg);
+                        sleepQuiet(600);
+                        break;
+                    }
+                    say("Serveur " + s.name + " : nouvel essai avec 1 seul flux…");
+                    sleepQuiet(500);
+                }
             }
         }
         throw new IOException(errs.length() > 0 ? errs.toString() : "aucun serveur disponible");
@@ -888,9 +963,7 @@ public class MainActivity extends Activity {
 
     /** Vrai téléchargement de 50 Mo avec bascule automatique de serveur. */
     double[] real50Any() throws Exception {
-        List<Server> order = new ArrayList<>();
-        order.add(cur);
-        for (Server s : SERVERS) if (s != cur) order.add(s);
+        List<Server> order = candidates(cur, false);
         StringBuilder errs = new StringBuilder();
         for (Server s : order) {
             chk();
@@ -1381,7 +1454,7 @@ public class MainActivity extends Activity {
                     + "\nMoyenne : " + fr(p.mean, 2) + " ms ± " + fr(p.margin, 2)
                     + " ms (marge d'erreur à 95 %) · Écart-type : " + fr(p.std, 2)
                     + " ms\n95 % des pings sous " + fr(p.p95, 1) + " ms · " + p.n + " mesures, "
-                    + p.outliers + " pic(s) écarté(s)");
+                    + p.outliers + " pic(s) écarté(s)\n" + probeInfo);
             out.add("Ping : " + fr(p.med, 1) + " ms (gigue " + fr(p.jitter, 1) + " ms, ± " + fr(p.margin, 2) + ")");
         } catch (Throwable e) {
             log("Ping ÉCHEC : " + e.getMessage());
